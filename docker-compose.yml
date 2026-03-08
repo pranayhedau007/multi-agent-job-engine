@@ -1,0 +1,15 @@
+# Qdrant vector database for resume-JD semantic matching.
+# Start: docker compose up -d
+# Dashboard: http://localhost:6333/dashboard
+# API: http://localhost:6333
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: job-engine-qdrant
+    ports:
+      - "6333:6333"   # REST API
+      - "6334:6334"   # gRPC (used by qdrant-client for faster ops)
+    volumes:
+      - ./qdrant_storage:/qdrant/storage   # Persist data across restarts
+    restart: unless-stopped
