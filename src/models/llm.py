@@ -25,6 +25,9 @@ from src.config import settings #config settings
                      Default 0.3 is a good balance for structured tasks.
         streaming: If True, returns tokens as they're generated.
                    Used in the Streamlit UI for real-time output.
+        json_mode: If True, constrains the model to output valid JSON.
+                   Ollama uses format='json' (token-level constraint).
+                   OpenAI uses response_format={'type': 'json_object'}.
 
     Returns:
         A LangChain chat model (either ChatOpenAI or ChatOllama).
@@ -34,34 +37,41 @@ from src.config import settings #config settings
     Raises:
         ValueError: If LLM_PROVIDER in .env is not "openai" or "ollama"
     """
-def get_llm(temperature: float = 0.3, streaming: bool = False) -> BaseChatModel:
+def get_llm(temperature: float = 0.3, streaming: bool = False, json_mode: bool = False) -> BaseChatModel:
     
     provider = settings.llm_provider.lower()
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        return ChatOpenAI(
+        kwargs = dict(
             model=settings.openai_model,
             temperature=temperature,
             streaming=streaming,
             api_key=settings.openai_api_key,
         )
+        if json_mode:
+            kwargs["model_kwargs"] = {"response_format": {"type": "json_object"}}
+        return ChatOpenAI(**kwargs)
 
     elif provider == "ollama":
         from langchain_ollama import ChatOllama
 
-        return ChatOllama(
+        kwargs = dict(
             model=settings.ollama_model,
             temperature=temperature,
             base_url=settings.ollama_base_url,
         )
+        if json_mode:
+            kwargs["format"] = "json"
+        return ChatOllama(**kwargs)
 
     else:
         raise ValueError(
             f"Unknown LLM_PROVIDER: '{provider}'. "
             f"Set LLM_PROVIDER to 'openai' or 'ollama' in your .env file."
         )
+
 
 """Purpose: Separate LLM instance for evaluation (LLM-as-judge).
 

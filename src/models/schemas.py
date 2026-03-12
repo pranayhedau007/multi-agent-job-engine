@@ -7,7 +7,7 @@ Agents don't pass raw dicts they pass typed, validated objects.
     immediately instead of letting it silently corrupt downstream agents.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from enum import Enum
 
 
@@ -32,6 +32,31 @@ class JobListing(BaseModel):
         default=True,
         description="Whether role supports F-1/OPT sponsorship"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_none_to_defaults(cls, values):
+        """Small LLMs (llama3.2) sometimes return null instead of ""
+        for optional string fields. Coerce None → empty string."""
+        if isinstance(values, dict):
+            str_fields = ["title", "company", "location", "url",
+                          "summary", "posted_date"]
+            for field in str_fields:
+                if field in values and values[field] is None:
+                    values[field] = ""
+        return values
+
+    @field_validator("key_skills", mode="before")
+    @classmethod
+    def coerce_key_skills(cls, v):
+        """Small LLMs sometimes return key_skills as a single string
+        like 'AI/ML Engineering' instead of a list. Coerce to list."""
+        if isinstance(v, str):
+            return [v] if v else []
+        if v is None:
+            return []
+        return v
+
 
 """Purpose: Resume-to-JD match analysis produced by the Fit Analyst agent.
 

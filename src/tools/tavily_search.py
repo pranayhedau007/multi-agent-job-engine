@@ -23,9 +23,11 @@ Usage:
 
 import json
 import logging
+import re
 
 from tavily import TavilyClient
 from langchain_core.tools import tool
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.config import settings
 from src.models.schemas import JobListing
@@ -95,6 +97,46 @@ def search_jobs(query: str, max_results: int = 10) -> str:
     return json.dumps(raw, indent=2)
 
 
+def _extract_json(text: str) -> str:
+    """Purpose: Robustly extract a JSON array from LLM output.
+
+    Small local LLMs (like llama3.2) often ignore "return ONLY JSON"
+    instructions. They wrap JSON in markdown fences, add preamble like
+    "Here is the JSON:", or append explanations after the array.
+
+    Strategy (ordered by reliability):
+        1. Strip markdown fences (```json ... ``` or ``` ... ```)
+        2. Try parsing the stripped text directly
+        3. Regex fallback: find the outermost [...] in the text
+    """
+    content = text.strip()
+
+    # Step 1: Strip markdown fences if present
+    if content.startswith("```"):
+        lines = content.split("\n")
+        # Remove first line (```json or ```) and last line (```)
+        start = 1
+        end = len(lines)
+        if lines[-1].strip() == "```":
+            end = -1
+        content = "\n".join(lines[start:end]).strip()
+    elif content.endswith("```"):
+        content = content[:-3].strip()
+
+    # Step 2: If it looks like valid JSON already, return it
+    if content.startswith("["):
+        return content
+
+    # Step 3: Regex fallback — find the outermost JSON array in prose
+    # This handles: "Here is the JSON:\n\n[{...}, {...}]\n\nThis is..."
+    match = re.search(r"\[.*\]", content, re.DOTALL)
+    if match:
+        return match.group(0)
+
+    # Nothing found — return whatever we have so json.loads gives a clear error
+    return content
+
+
 """Purpose: Use LLM to parse raw Tavily results into structured JobListing objects.
 
     Args:
@@ -112,53 +154,78 @@ def search_jobs(query: str, max_results: int = 10) -> str:
     """
 def parse_search_to_listings(raw_results: str, user_query: str) -> list[JobListing]:
     
-    llm = get_llm(temperature=0.1)  # Low temp = precise, consistent extraction
+    # json_mode=True activates Ollama's format='json' which constrains
+    # token generation to produce valid JSON — critical for small models
+    # like llama3.2 that ignore "return ONLY JSON" text instructions
+    llm = get_llm(temperature=0.1, json_mode=True)
 
-#Setting context for LLM using a system prompt for a guided outputs
-    prompt = f"""You are a job listing parser. Given raw web search results for the query "{user_query}",
-extract ONLY actual job postings (not blog posts, news articles, career guides, or listicles).
+    # Using SystemMessage + HumanMessage split helps Ollama models
+    # separate instructions from data, improving JSON-only compliance.
+    # The few-shot example shows the exact output shape we expect.
+    system_msg = SystemMessage(content=(
+        "You are a job listing parser that outputs JSON.\n"
+        "Given raw web search results, extract ONLY actual job postings "
+        "(not blog posts, news articles, career guides, or listicles).\n\n"
+        "For each real job listing found, return a JSON object with these fields:\n"
+        "  title, company, location, url, summary, key_skills, posted_date, visa_friendly\n\n"
+        "Return a JSON object with a \"listings\" key containing an array of job objects.\n"
+        "If no real job listings are found, return {\"listings\": []}.\n\n"
+        "Example output:\n"
+        "{\"listings\": [{\"title\": \"ML Engineer Intern\", \"company\": \"NVIDIA\", "
+        "\"location\": \"Santa Clara, CA\", \"url\": \"https://nvidia.com/jobs/123\", "
+        "\"summary\": \"Work on deep learning models for autonomous driving.\", "
+        "\"key_skills\": [\"Python\", \"PyTorch\", \"CUDA\"], "
+        "\"posted_date\": \"Unknown\", \"visa_friendly\": true}]}"
+    ))
 
-For each real job listing found, extract:
-- title: exact job title as posted
-- company: company name
-- location: job location (city, state or "Remote")
-- url: direct application URL
-- summary: 2-3 sentence summary of the role and requirements
-- key_skills: list of technical skills mentioned in the posting
-- posted_date: when posted (if visible, otherwise "Unknown")
-- visa_friendly: true UNLESS the posting explicitly says "no sponsorship" or "must be authorized to work without sponsorship"
+    # Truncate raw results to avoid overwhelming the small model's context
+    truncated = raw_results[:6000] if len(raw_results) > 6000 else raw_results
 
-Return a JSON array of objects. If no real job listings are found, return [].
-Return ONLY valid JSON — no markdown fences, no explanation, no preamble.
+    human_msg = HumanMessage(content=(
+        f"Search query: \"{user_query}\"\n\n"
+        f"Raw search results:\n{truncated}"
+    ))
 
-Raw search results:
-{raw_results}"""
+    response = llm.invoke([system_msg, human_msg])
+    raw_content = response.content.strip() if response.content else ""
 
-    response = llm.invoke(prompt)
-    content = response.content.strip()
+    if not raw_content:
+        logger.error("LLM returned empty response — no content to parse")
+        return []
 
-    # LLMs sometimes wrap JSON in ```json ... ``` markdown fences
-    # so we gonna Strip them if present
-    if content.startswith("```"):
-        # Remove first line (```json) and last line (```)
-        content = content.split("\n", 1)[1] if "\n" in content else content[3:]
-    if content.endswith("```"):
-        content = content[:-3]
-    content = content.strip()
+    # Use robust extraction to handle any remaining formatting issues
+    content = _extract_json(raw_content)
 
     try:
         parsed = json.loads(content)
+
+        # Handle different response shapes from the LLM:
+        # 1. {"listings": [...]} — the expected shape from our prompt
+        # 2. [...] — a plain array (some models skip the wrapper)
+        # 3. {...} — a single job object (Ollama JSON mode quirk)
+        if isinstance(parsed, dict):
+            if "listings" in parsed:
+                items = parsed["listings"]
+            else:
+                # Single job object — wrap in list
+                items = [parsed]
+        elif isinstance(parsed, list):
+            items = parsed
+        else:
+            logger.warning(f"Unexpected JSON type: {type(parsed)}")
+            return []
+
         # Validate each item through the Pydantic model
         listings = []
-        for item in parsed:
+        for item in items:
             if isinstance(item, dict):
                 try:
                     listings.append(JobListing(**item))
                 except Exception as e:
                     logger.warning(f"Skipped invalid listing: {e}")
-        logger.info(f"Parsed {len(listings)} valid job listings from {len(parsed)} raw items")
+        logger.info(f"Parsed {len(listings)} valid job listings from {len(items)} raw items")
         return listings
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse LLM response as JSON: {e}")
-        logger.debug(f"Raw LLM response: {content[:500]}")
+        logger.info(f"Raw LLM response (first 500 chars): {raw_content[:500]}")
         return []
