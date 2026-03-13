@@ -22,28 +22,9 @@ The entire system supports hybrid LLM execution: OpenAI GPT-4o-mini for polished
 
 ## How it works
 
-```
-                      User Input
-                    (roles, resume)
-                          |
-                    [ SUPERVISOR ]     Routes to the right agent
-                          |
-          ----------------+----------------
-          |               |               |
-    [ JOB SCOUT ]   [ FIT ANALYST ]  [ OUTREACH ]
-    Tavily search    Qdrant vectors    LinkedIn msgs
-    LLM parsing      + LLM scoring     Cold emails
-          |               |               |
-          |         [ RESUME TAILOR ]      |
-          |          Rewrites bullets      |
-          |          Adds JD keywords      |
-          |               |               |
-          +-------[ HUMAN APPROVAL ]------+
-                    You review first
-                          |
-                    [ RESULTS +
-                     EVALUATION ]
-```
+![Architecture Diagram](assets/ArchDiagram.png)
+---
+
 
 You give it your resume PDF and target roles. The pipeline:
 
